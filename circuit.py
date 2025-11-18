@@ -12,9 +12,39 @@ from attribution import patching_effect, jvp
 from circuit_plotting import plot_circuit, plot_circuit_posaligned
 from dictionary_learning import AutoEncoder
 from data_loading_utils import load_examples, load_examples_nopair
-from dictionary_loading_utils import load_saes_and_submodules
+from dictionary_loading_utils import load_saes_and_submodules, _get_preferred_device
 from nnsight import LanguageModel
 from coo_utils import sparse_reshape
+
+
+def _sparse_sum_safe(sparse_tensor, dim):
+    """Sum sparse tensor, handling MPS limitation by using CPU for sparse ops."""
+    if sparse_tensor.is_sparse and sparse_tensor.device.type == "mps":
+        sparse_tensor = sparse_tensor.to("cpu")
+        result = sparse_tensor.sum(dim=dim)
+        result = result.to("mps")
+        return result
+    return sparse_tensor.sum(dim=dim)
+
+
+def _sparse_div_safe(sparse_tensor, scalar):
+    """Divide sparse tensor by scalar, handling MPS limitation by using CPU for sparse ops."""
+    if sparse_tensor.is_sparse and sparse_tensor.device.type == "mps":
+        sparse_tensor = sparse_tensor.to("cpu")
+        result = sparse_tensor / scalar
+        result = result.to("mps")
+        return result
+    return sparse_tensor / scalar
+
+
+def _sparse_reshape_safe(sparse_tensor, shape):
+    """Reshape sparse tensor, handling MPS limitation by using CPU for sparse ops."""
+    if sparse_tensor.is_sparse and sparse_tensor.device.type == "mps":
+        sparse_tensor = sparse_tensor.to("cpu")
+        result = sparse_reshape(sparse_tensor, shape)
+        result = result.to("mps")
+        return result
+    return sparse_reshape(sparse_tensor, shape)
 
 def get_circuit(
     clean,
@@ -141,9 +171,9 @@ def get_circuit(
             for parent in edges[child]:
                 weight_matrix = edges[child][parent]
                 if parent == "y":
-                    weight_matrix = weight_matrix.sum(dim=1)
+                    weight_matrix = _sparse_sum_safe(weight_matrix, dim=1)
                 else:
-                    weight_matrix = weight_matrix.sum(dim=(1, 4))
+                    weight_matrix = _sparse_sum_safe(weight_matrix, dim=(1, 4))
                 edges[child][parent] = weight_matrix
         for node in nodes:
             if node != "y":
@@ -155,11 +185,11 @@ def get_circuit(
             for parent in edges[child]:
                 weight_matrix = edges[child][parent]
                 if parent == "y":
-                    weight_matrix = weight_matrix.sum(dim=0) / bc
+                    weight_matrix = _sparse_div_safe(_sparse_sum_safe(weight_matrix, dim=0), bc)
                 else:
                     bp, _ = nodes[parent].act.shape
                     assert bp == bc
-                    weight_matrix = weight_matrix.sum(dim=(0, 2)) / bc
+                    weight_matrix = _sparse_div_safe(_sparse_sum_safe(weight_matrix, dim=(0, 2)), bc)
                 edges[child][parent] = weight_matrix
         for node in nodes:
             if node != "y":
@@ -173,12 +203,12 @@ def get_circuit(
             for parent in edges[child]:
                 weight_matrix = edges[child][parent]
                 if parent == "y":
-                    weight_matrix = sparse_reshape(weight_matrix, (bc, sc, fc + 1))
-                    weight_matrix = weight_matrix.sum(dim=0) / bc
+                    weight_matrix = _sparse_reshape_safe(weight_matrix, (bc, sc, fc + 1))
+                    weight_matrix = _sparse_div_safe(_sparse_sum_safe(weight_matrix, dim=0), bc)
                 else:
                     bp, sp, fp = nodes[parent].act.shape
                     assert bp == bc
-                    weight_matrix = weight_matrix.sum(dim=(0, 3)) / bc
+                    weight_matrix = _sparse_div_safe(_sparse_sum_safe(weight_matrix, dim=(0, 3)), bc)
                 edges[child][parent] = weight_matrix
         for node in nodes:
             nodes[node] = nodes[node].mean(dim=0)
@@ -460,10 +490,15 @@ if __name__ == "__main__":
         help="Directory to save figures.",
     )
     parser.add_argument("--seed", type=int, default=12)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default=None, help="Device to use (default: auto-detect MPS/CUDA/CPU)")
     args = parser.parse_args()
 
-    device = t.device(args.device)
+    if args.device is not None:
+        device = t.device(args.device)
+    else:
+        device = _get_preferred_device()
+
+    print(f"Using device: {device}")
 
     model_configs = {
         "EleutherAI/pythia-70m-deduped": dict(

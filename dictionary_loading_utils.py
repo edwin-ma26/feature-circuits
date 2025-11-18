@@ -10,6 +10,63 @@ import os
 
 DICT_DIR = os.path.dirname(os.path.abspath(__file__)) + "/dictionaries"
 
+
+def _get_preferred_device() -> t.device:
+    """Return the preferred torch device.
+
+    Preference order: MPS (Apple Metal) if available, then CUDA, then CPU.
+    """
+    try:
+        if hasattr(t.backends, "mps") and t.backends.mps.is_available():
+            return t.device("mps")
+    except Exception:
+        # In case torch doesn't expose MPS backend the check can fail; ignore.
+        pass
+    if t.cuda.is_available():
+        return t.device("cuda")
+    return t.device("cpu")
+
+
+def _safe_t_load(path: str):
+    """Load a torch file mapping storages to CPU first to avoid CUDA-only deserialization errors."""
+    try:
+        return t.load(path, map_location="cpu")
+    except Exception:
+        # Fallback to default load if map_location fails for some reason
+        return t.load(path)
+
+
+def _safe_autoencoder_from_pretrained(path: str, dtype: t.dtype, device: t.device | None):
+    state_dict = _safe_t_load(path)
+    dict_size, activation_dim = state_dict["encoder.weight"].shape
+    ae = AutoEncoder(activation_dim, dict_size)
+    ae.load_state_dict(state_dict)
+    if hasattr(ae, "normalize_decoder"):
+        ae.normalize_decoder()
+    if device is not None:
+        ae = ae.to(dtype=dtype, device=device)
+    return ae
+
+
+def _safe_jumprelu_from_pretrained(
+    path: str | None = None,
+    load_from_sae_lens: bool = False,
+    dtype: t.dtype = t.float32,
+    device: t.device | None = None,
+    **kwargs,
+):
+    if load_from_sae_lens:
+        # Let the library handle SAE Lens loading since it may not be a simple state dict
+        return JumpReluAutoEncoder.from_pretrained(
+            path, load_from_sae_lens=load_from_sae_lens, dtype=dtype, device=device, **kwargs
+        )
+    state_dict = _safe_t_load(path)
+    activation_dim, dict_size = state_dict["W_enc"].shape
+    ae = JumpReluAutoEncoder(activation_dim, dict_size)
+    ae.load_state_dict(state_dict)
+    ae = ae.to(dtype=dtype, device=device)
+    return ae
+
 DictionaryStash = namedtuple("DictionaryStash", ["embed", "attns", "mlps", "resids"])
 
 
@@ -27,8 +84,10 @@ def _load_pythia_saes_and_submodules(
     include_embed: bool = True,
     neurons: bool = False,
     dtype: t.dtype = t.float32,
-    device: t.device = t.device("cpu"),
+    device: t.device | None = None,
 ):
+    if device is None:
+        device = _get_preferred_device()
     assert (
         len(model.gpt_neox.layers) == 6
     ), "Not the expected number of layers for pythia-70m-deduped"
@@ -45,7 +104,7 @@ def _load_pythia_saes_and_submodules(
             submodule=model.gpt_neox.embed_in,
         )
         if not neurons:
-            dictionaries[embed] = AutoEncoder.from_pretrained(
+            dictionaries[embed] = _safe_autoencoder_from_pretrained(
                 f"{DICT_DIR}/pythia-70m-deduped/embed/10_32768/ae.pt",
                 dtype=dtype,
                 device=device,
@@ -76,17 +135,17 @@ def _load_pythia_saes_and_submodules(
             )
         )
         if not neurons:
-            dictionaries[attn] = AutoEncoder.from_pretrained(
+            dictionaries[attn] = _safe_autoencoder_from_pretrained(
                 f"{DICT_DIR}/pythia-70m-deduped/attn_out_layer{i}/10_32768/ae.pt",
                 dtype=dtype,
                 device=device,
             )
-            dictionaries[mlp] = AutoEncoder.from_pretrained(
+            dictionaries[mlp] = _safe_autoencoder_from_pretrained(
                 f"{DICT_DIR}/pythia-70m-deduped/mlp_out_layer{i}/10_32768/ae.pt",
                 dtype=dtype,
                 device=device,
             )
-            dictionaries[resid] = AutoEncoder.from_pretrained(
+            dictionaries[resid] = _safe_autoencoder_from_pretrained(
                 f"{DICT_DIR}/pythia-70m-deduped/resid_out_layer{i}/10_32768/ae.pt",
                 dtype=dtype,
                 device=device,
@@ -112,8 +171,11 @@ def load_gpt2_sae(
     layer: int,
     neurons: bool = False,
     dtype: t.dtype = t.float32,
-    device: t.device = t.device("cpu"),
+    device: t.device | None = None,
 ):
+    if device is None:
+        device = _get_preferred_device()
+
     if neurons:
         return IdentityDict(768)
 
@@ -125,7 +187,8 @@ def load_gpt2_sae(
     if submod_type == "resid":
         sae_layer += ".pt"
 
-    return JumpReluAutoEncoder.from_pretrained(
+    return _safe_jumprelu_from_pretrained(
+        None,
         load_from_sae_lens=True,
         release=repo_id,
         sae_id=sae_layer,
@@ -141,8 +204,10 @@ def _load_gpt2_saes_and_submodules(
     include_embed: bool = True,
     neurons: bool = False,
     dtype: t.dtype = t.float32,
-    device: t.device = t.device("cpu"),
+    device: t.device | None = None,
 ):
+    if device is None:
+        device = _get_preferred_device()
     assert (
         len(model.transformer.h) == 12
     ), "Not the expected number of layers for GPT-2 Small"
@@ -210,8 +275,11 @@ def load_gemma_sae(
     width: Literal["16k", "65k"] = "16k",
     neurons: bool = False,
     dtype: t.dtype = t.float32,
-    device: t.device = t.device("cpu"),
+    device: t.device | None = None,
 ):
+    if device is None:
+        device = _get_preferred_device()
+
     if neurons:
         if submod_type != "attn":
             return IdentityDict(2304)
@@ -235,7 +303,8 @@ def load_gemma_sae(
     ]
     optimal_file = min(files_with_l0s, key=lambda x: abs(x[1] - 100))[0]
     optimal_file = optimal_file.split("/params.npz")[0]
-    return JumpReluAutoEncoder.from_pretrained(
+    return _safe_jumprelu_from_pretrained(
+        None,
         load_from_sae_lens=True,
         release=repo_id.split("google/")[-1],
         sae_id=optimal_file,
@@ -251,8 +320,10 @@ def _load_gemma_saes_and_submodules(
     include_embed: bool = True,
     neurons: bool = False,
     dtype: t.dtype = t.float32,
-    device: t.device = t.device("cpu"),
+    device: t.device | None = None,
 ):
+    if device is None:
+        device = _get_preferred_device()
     assert (
         len(model.model.layers) == 26
     ), "Not the expected number of layers for Gemma-2-2B"
@@ -324,8 +395,10 @@ def load_saes_and_submodules(
     include_embed: bool = True,
     neurons: bool = False,
     dtype: t.dtype = t.float32,
-    device: t.device = t.device("cpu"),
+    device: t.device | None = None,
 ):
+    if device is None:
+        device = _get_preferred_device()
     model_name = model.config._name_or_path
 
     if model_name == "EleutherAI/pythia-70m-deduped":

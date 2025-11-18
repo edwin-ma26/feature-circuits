@@ -1,4 +1,5 @@
 from collections import namedtuple
+import os
 import torch as t
 from tqdm import tqdm
 from numpy import ndindex
@@ -289,6 +290,13 @@ def jvp(
     values = []
 
     downstream_idxs = downstream_features.to_tensor().nonzero()
+    num_downstream = downstream_idxs.shape[0]
+    debug_jvp = os.environ.get("FEATURE_CIRCUITS_DEBUG_JVP", "").lower() in ("1", "true", "yes")
+    iterator = downstream_idxs
+    if debug_jvp:
+        desc = f"JVP {downstream_submod.name}->{upstream_submod.name} ({num_downstream} selections)"
+        iterator = tqdm(downstream_idxs, total=num_downstream, desc=desc, leave=False)
+
     with model.trace(input):
         # forward pass modifications
         x = upstream_submod.get_activation()
@@ -304,7 +312,7 @@ def jvp(
 
         to_backprops = (left_vec @ downstream_act).to_tensor()
 
-        for downstream_idx in downstream_idxs:
+        for downstream_idx in iterator:
             # stop grad
             for submodule in intermediate_stopgrads:
                 submodule.stop_grad()

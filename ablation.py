@@ -1,6 +1,9 @@
-from nnsight import LanguageModel
-import torch as t
+import os
 from argparse import ArgumentParser
+
+import torch as t
+from nnsight import LanguageModel
+
 from activation_utils import SparseAct
 from data_loading_utils import load_examples
 from dictionary_loading_utils import load_saes_and_submodules
@@ -44,8 +47,10 @@ def run_with_ablations(
             # ablate features
             if complement:
                 submod_nodes = ~submod_nodes
+            # Extract the integer dimension outside the proxy to avoid TypeError
+            res_last_dim = int(dictionary.dict_size)
             submod_nodes.resc = submod_nodes.resc.expand(
-                *submod_nodes.resc.shape[:-1], res.shape[-1]
+                *submod_nodes.resc.shape[:-1], res_last_dim
             )
             if handle_errors == "remove":
                 submod_nodes.resc = t.zeros_like(submod_nodes.resc).to(t.bool)
@@ -139,9 +144,14 @@ if __name__ == "__main__":
         submod: circuit[submod.name].abs() > args.threshold for submod in submodules
     }
 
-    # Load examples
+    # Load examples with flexible path handling
+    dataset_path = args.data
+    if not dataset_path.startswith("/") and not dataset_path.startswith("data/"):
+        dataset_path = os.path.join("data", dataset_path)
+    if not dataset_path.endswith(".json"):
+        dataset_path = dataset_path + ".json"
     examples = load_examples(
-        f"data/{args.data}.json", args.examples, model, use_min_length_only=True
+        dataset_path, args.examples, model, use_min_length_only=True
     )
 
     # Define ablation function
