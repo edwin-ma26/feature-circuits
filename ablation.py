@@ -2,7 +2,7 @@ from nnsight import LanguageModel
 import torch as t
 from argparse import ArgumentParser
 from activation_utils import SparseAct
-from loading_utils import load_examples
+from data_loading_utils import load_examples
 from dictionary_loading_utils import load_saes_and_submodules
 
 

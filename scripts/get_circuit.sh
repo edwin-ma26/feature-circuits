@@ -13,4 +13,5 @@ python circuit.py \
     --dataset $DATA \
 	--node_threshold $NODE \
 	--edge_threshold $EDGE \
-	--aggregation $AGG
+	--aggregation $AGG \
+    --device cpu

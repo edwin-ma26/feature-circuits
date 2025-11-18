@@ -209,27 +209,46 @@ def get_circuit_cluster(
     dictionaries=None,
 ):
     
-    n_layers = {
-        "EleutherAI/pythia-70m-deduped": 6,
-        "google/gemma-2-2b": 26,
-    }[model_name]
-    parallel_attn = {
-        "EleutherAI/pythia-70m-deduped": True,
-        "google/gemma-2-2b": False,
-    }[model_name]
-    include_embed = {
-        "EleutherAI/pythia-70m-deduped": True,
-        "google/gemma-2-2b": False,
-    }[model_name]
-    dtype = {
-        "EleutherAI/pythia-70m-deduped": t.float32,
-        "google/gemma-2-2b": t.bfloat16,
-    }[model_name]
+    model_configs = {
+        "EleutherAI/pythia-70m-deduped": dict(
+            layers=6,
+            parallel_attn=True,
+            include_embed=True,
+            dtype=t.float32,
+        ),
+        "google/gemma-2-2b": dict(
+            layers=26,
+            parallel_attn=False,
+            include_embed=False,
+            dtype=t.bfloat16,
+        ),
+        "gpt2": dict(
+            layers=12,
+            parallel_attn=False,
+            include_embed=True,
+            dtype=t.float32,
+        ),
+        "openai-community/gpt2": dict(
+            layers=12,
+            parallel_attn=False,
+            include_embed=True,
+            dtype=t.float32,
+        ),
+    }
+    if model_name not in model_configs:
+        raise ValueError(f"Model {model_name} not supported")
+    config = model_configs[model_name]
+    n_layers = config["layers"]
+    parallel_attn = config["parallel_attn"]
+    include_embed = config["include_embed"]
+    dtype = config["dtype"]
 
     if model_name == "EleutherAI/pythia-70m-deduped":
         model = LanguageModel(model_name, device_map=device, dispatch=True, torch_dtype=dtype)
     elif model_name == "google/gemma-2-2b":
         model = LanguageModel(model_name, device_map=device, dispatch=True, attn_implementation="eager", torch_dtype=dtype)
+    else:
+        model = LanguageModel(model_name, device_map=device, dispatch=True, torch_dtype=dtype)
     
     submodules, dictionaries = load_saes_and_submodules(
         model,
@@ -446,22 +465,39 @@ if __name__ == "__main__":
 
     device = t.device(args.device)
 
-    n_layers = {
-        "EleutherAI/pythia-70m-deduped": 6,
-        "google/gemma-2-2b": 26,
-    }[args.model]
-    parallel_attn = {
-        "EleutherAI/pythia-70m-deduped": True,
-        "google/gemma-2-2b": False,
-    }[args.model]
-    include_embed = {
-        "EleutherAI/pythia-70m-deduped": True,
-        "google/gemma-2-2b": False,
-    }[args.model]
-    dtype = {
-        "EleutherAI/pythia-70m-deduped": t.float32,
-        "google/gemma-2-2b": t.bfloat16,
-    }[args.model]
+    model_configs = {
+        "EleutherAI/pythia-70m-deduped": dict(
+            layers=6,
+            parallel_attn=True,
+            include_embed=True,
+            dtype=t.float32,
+        ),
+        "google/gemma-2-2b": dict(
+            layers=26,
+            parallel_attn=False,
+            include_embed=False,
+            dtype=t.bfloat16,
+        ),
+        "gpt2": dict(
+            layers=12,
+            parallel_attn=False,
+            include_embed=True,
+            dtype=t.float32,
+        ),
+        "openai-community/gpt2": dict(
+            layers=12,
+            parallel_attn=False,
+            include_embed=True,
+            dtype=t.float32,
+        ),
+    }
+    if args.model not in model_configs:
+        raise ValueError(f"Model {args.model} not supported")
+    config = model_configs[args.model]
+    n_layers = config["layers"]
+    parallel_attn = config["parallel_attn"]
+    include_embed = config["include_embed"]
+    dtype = config["dtype"]
 
     if args.model == "EleutherAI/pythia-70m-deduped":
         model = LanguageModel(args.model, device_map=device, dispatch=True, torch_dtype=dtype)
@@ -471,6 +507,13 @@ if __name__ == "__main__":
             device_map=device,
             dispatch=True,
             attn_implementation="eager",
+            torch_dtype=dtype,
+        )
+    else:  # GPT-2 variants
+        model = LanguageModel(
+            args.model,
+            device_map=device,
+            dispatch=True,
             torch_dtype=dtype,
         )
 
