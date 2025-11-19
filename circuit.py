@@ -17,6 +17,13 @@ from nnsight import LanguageModel
 from coo_utils import sparse_reshape
 
 
+def _safe_to_device(tensor, device):
+    # Sparse tensors lack many ops on MPS; keep them on CPU instead.
+    if isinstance(tensor, t.Tensor) and tensor.is_sparse and device.type == "mps":
+        return tensor.to("cpu")
+    return tensor.to(device)
+
+
 def _sparse_sum_safe(sparse_tensor, dim):
     """Sum sparse tensor, handling MPS limitation by using CPU for sparse ops."""
     if sparse_tensor.is_sparse and sparse_tensor.device.type == "mps":
@@ -61,6 +68,7 @@ def get_circuit(
     nodes_only=False,
     parallel_attn=False,
     node_threshold=0.1,
+    attrib_method="ig",
 ):
     all_submods = ([embed] if embed is not None else []) + [
         submod for layer_submods in zip(attns, mlps, resids) for submod in layer_submods
@@ -75,7 +83,7 @@ def get_circuit(
         dictionaries,
         metric_fn,
         metric_kwargs=metric_kwargs,
-        method="ig",  # get better approximations for early layers by using ig
+        method=attrib_method,
     )
 
     features_by_submod = {
@@ -448,6 +456,19 @@ if __name__ == "__main__":
         help="Indirect effect threshold for keeping edges.",
     )
     parser.add_argument(
+        "--thru_layer",
+        type=int,
+        default=None,
+        help="Only load and analyze layers up to (and including) this index.",
+    )
+    parser.add_argument(
+        "--attrib_method",
+        type=str,
+        default="ig",
+        choices=["attrib", "ig", "exact"],
+        help="Attribution method to use when computing node effects.",
+    )
+    parser.add_argument(
         "--pen_thickness",
         type=float,
         default=1,
@@ -529,7 +550,10 @@ if __name__ == "__main__":
     if args.model not in model_configs:
         raise ValueError(f"Model {args.model} not supported")
     config = model_configs[args.model]
-    n_layers = config["layers"]
+    if args.thru_layer is not None:
+        n_layers = min(config["layers"], args.thru_layer + 1)
+    else:
+        n_layers = config["layers"]
     parallel_attn = config["parallel_attn"]
     include_embed = config["include_embed"]
     dtype = config["dtype"]
@@ -613,6 +637,7 @@ if __name__ == "__main__":
             neurons=args.use_neurons,
             device=device,
             dtype=dtype,
+            thru_layer=args.thru_layer,
         )
 
         running_nodes = None
@@ -665,6 +690,7 @@ if __name__ == "__main__":
                 aggregation=args.aggregation,
                 node_threshold=args.node_threshold,
                 parallel_attn=parallel_attn,
+                attrib_method=args.attrib_method,
             )
 
             if running_nodes is None:
@@ -696,7 +722,7 @@ if __name__ == "__main__":
         if not args.nodes_only:
             edges = {
                 k: {
-                    kk: 1 / num_examples * v.to(device)
+                    kk: 1 / num_examples * _safe_to_device(v, device)
                     for kk, v in running_edges[k].items()
                 }
                 for k in running_edges.keys()

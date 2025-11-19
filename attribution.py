@@ -287,6 +287,7 @@ def jvp(
 
     upstream_idxs = []
     values = []
+    downstream_idx_list = []
 
     downstream_idxs = downstream_features.to_tensor().nonzero()
     with model.trace(input):
@@ -313,23 +314,44 @@ def jvp(
             vjv = (upstream_act.grad @ right_vec).to_tensor()
             to_backprops[tuple(downstream_idx)].backward(retain_graph=True)
 
-            upstream_idxs.append(vjv.nonzero().save()) # type: ignore
-            values.append(vjv[vjv != 0].save()) # type: ignore
+            mask = vjv != 0
+            coords = mask.nonzero()
+            downstream_idx_list.append(downstream_idx.clone())
+            upstream_idxs.append(coords.save()) # type: ignore
+            values.append(vjv[coords[:, 0], coords[:, 1], coords[:, 2]].save()) # type: ignore
 
     upstream_idxs = [x.value for x in upstream_idxs]
     values = [x.value for x in values]
 
-    # assemble the information into a sparse tensor
-    downstream_idxs = t.cat(
-        [
-            downstream_idx.repeat(upstream_idx.shape[0], 1)
-            for downstream_idx, upstream_idx in zip(downstream_idxs, upstream_idxs)
-        ],
-        dim=0
-    )
-    idxs = t.cat([downstream_idxs, t.cat(upstream_idxs, dim=0)], dim=1)
-    
-    values = t.cat(values, dim=0)
+    idx_chunks = []
+    value_chunks = []
+    for downstream_idx, upstream_idx, vals in zip(downstream_idx_list, upstream_idxs, values):
+        if upstream_idx.numel() == 0 or vals.numel() == 0:
+            continue
+        if upstream_idx.shape[0] != vals.shape[0]:
+            raise RuntimeError(
+                f"Mismatch between upstream indices ({upstream_idx.shape[0]}) and values ({vals.shape[0]}) "
+                f"for edge {downstream_submod.name}->{upstream_submod.name}"
+            )
+        repeated_downstream = downstream_idx.repeat(upstream_idx.shape[0], 1)
+        idx_chunks.append(t.cat([repeated_downstream, upstream_idx], dim=1))
+        value_chunks.append(vals)
+
+    if len(value_chunks) == 0:
+        return t.sparse_coo_tensor(
+            t.zeros((2 * downstream_features.act.dim(), 0), dtype=t.long), 
+            t.zeros(0), 
+            size=(b, s, n_feats+1, b, s, n_feats+1)
+        ).to(model.device)
+
+    idxs = t.cat(idx_chunks, dim=0)
+    values = t.cat(value_chunks, dim=0)
+
+    if idxs.shape[0] != values.shape[0]:
+        raise RuntimeError(
+            f"Mismatch assembling sparse tensor: {idxs.shape[0]} indices vs {values.shape[0]} values "
+            f"for edge {downstream_submod.name}->{upstream_submod.name}"
+        )
 
     return t.sparse_coo_tensor(
         idxs.T,
