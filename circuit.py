@@ -585,7 +585,7 @@ if __name__ == "__main__":
     if os.path.exists(save_path := f"{args.circuit_dir}/{save_base}_{node_suffix}.pt"):
         print(f"Loading circuit from {save_path}")
         with open(save_path, "rb") as infile:
-            save_dict = t.load(infile)
+            save_dict = t.load(infile, weights_only=False)
         nodes = save_dict["nodes"]
         edges = save_dict["edges"]
         loaded_from_disk = True
@@ -598,7 +598,7 @@ if __name__ == "__main__":
                 if node_thresh < args.node_threshold:
                     print(f"Loading circuit from {args.circuit_dir}/{f}")
                     with open(f"{args.circuit_dir}/{f}", "rb") as infile:
-                        save_dict = t.load(infile)
+                        save_dict = t.load(infile, weights_only=False)
                     nodes = save_dict["nodes"]
                     edges = save_dict["edges"]
                     loaded_from_disk = True

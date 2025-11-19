@@ -1,12 +1,10 @@
-import os
-from argparse import ArgumentParser
-
-import torch as t
 from nnsight import LanguageModel
-
+import torch as t
+from argparse import ArgumentParser
 from activation_utils import SparseAct
 from data_loading_utils import load_examples
 from dictionary_loading_utils import load_saes_and_submodules
+import os
 
 
 def run_with_ablations(
@@ -47,22 +45,30 @@ def run_with_ablations(
             # ablate features
             if complement:
                 submod_nodes = ~submod_nodes
-            # Extract the integer dimension outside the proxy to avoid TypeError
-            res_last_dim = int(dictionary.dict_size)
-            submod_nodes.resc = submod_nodes.resc.expand(
-                *submod_nodes.resc.shape[:-1], res_last_dim
-            )
+            
+            # submod_nodes.act is a feature-space mask for which features to keep
+            # submod_nodes.resc is a contracted residual mask (may be None or have batch dimension from circuit)
+            # We need to mask f (encoded features) but res (residual in model space) doesn't have a per-feature mask
+            
             if handle_errors == "remove":
-                submod_nodes.resc = t.zeros_like(submod_nodes.resc).to(t.bool)
-            if handle_errors == "keep":
-                submod_nodes.resc = t.ones_like(submod_nodes.resc).to(t.bool)
+                # Zero out residual completely
+                res_mask = t.ones(1, dtype=t.bool, device=res.device)  # keep nothing
+            elif handle_errors == "keep":
+                # Keep residual completely
+                res_mask = t.zeros(1, dtype=t.bool, device=res.device)  # remove nothing
+            else:  # default: use resc if available
+                res_mask = t.zeros(1, dtype=t.bool, device=res.device)  # remove nothing by default
 
             f[..., ~submod_nodes.act] = patch_states[submodule].act[
                 ..., ~submod_nodes.act
             ]
-            res[..., ~submod_nodes.resc] = patch_states[submodule].res[
-                ..., ~submod_nodes.resc
-            ]
+            # Only ablate the residual if we have a specific mask from resc
+            if handle_errors == "remove":
+                res[...] = patch_states[submodule].res[...]
+            elif handle_errors != "keep":
+                # For "default", don't ablate residual separately
+                # (it's already accounted for in the feature ablation)
+                pass
 
             submodule.set_activation(dictionary.decode(f) + res)
 
@@ -144,15 +150,16 @@ if __name__ == "__main__":
         submod: circuit[submod.name].abs() > args.threshold for submod in submodules
     }
 
-    # Load examples with flexible path handling
+    # Load examples
+    # Accept either a bare name (e.g. rc_test), a filename (rc_test.json), or a full path.
     dataset_path = args.data
+    # If user passed a bare name (not starting with data/ or /), place it under data/
     if not dataset_path.startswith("/") and not dataset_path.startswith("data/"):
         dataset_path = os.path.join("data", dataset_path)
+    # Ensure .json extension
     if not dataset_path.endswith(".json"):
         dataset_path = dataset_path + ".json"
-    examples = load_examples(
-        dataset_path, args.examples, model, use_min_length_only=True
-    )
+    examples = load_examples(dataset_path, args.examples, model, use_min_length_only=True)
 
     # Define ablation function
     if args.ablation == "resample":
