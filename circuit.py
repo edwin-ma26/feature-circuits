@@ -601,32 +601,28 @@ if __name__ == "__main__":
     ]
 
     loaded_from_disk = False
-    save_base = (
-        f"{args.model.split('/')[-1]}_{args.dataset}_n{num_examples}_agg{args.aggregation}"
-        + ("_neurons" if args.use_neurons else "")
-    )
-    node_suffix = f"node{args.node_threshold}" if not args.nodes_only else "nodeall"
-    if os.path.exists(save_path := f"{args.circuit_dir}/{save_base}_{node_suffix}.pt"):
+    base_parts = [
+        args.model.split("/")[-1],
+        args.dataset,
+        f"n{num_examples}",
+        f"agg{args.aggregation}",
+        f"attrib{args.attrib_method}",
+    ]
+    if args.thru_layer is not None:
+        base_parts.append(f"thru{args.thru_layer}")
+    if args.use_neurons:
+        base_parts.append("neurons")
+    if args.nodes_only:
+        base_parts.append("nodesonly")
+    save_stem = "_".join(base_parts + [f"node{args.node_threshold}", f"edge{args.edge_threshold}"])
+    save_path = f"{args.circuit_dir}/{save_stem}.pt"
+    if os.path.exists(save_path):
         print(f"Loading circuit from {save_path}")
         with open(save_path, "rb") as infile:
             save_dict = t.load(infile, weights_only=False)
         nodes = save_dict["nodes"]
         edges = save_dict["edges"]
         loaded_from_disk = True
-    elif not args.nodes_only:
-        for f in os.listdir(args.circuit_dir):
-            if "nodeall" in f:
-                continue
-            if f.startswith(save_base):
-                node_thresh = float(f.split(".")[0].split("_node")[-1])
-                if node_thresh < args.node_threshold:
-                    print(f"Loading circuit from {args.circuit_dir}/{f}")
-                    with open(f"{args.circuit_dir}/{f}", "rb") as infile:
-                        save_dict = t.load(infile, weights_only=False)
-                    nodes = save_dict["nodes"]
-                    edges = save_dict["edges"]
-                    loaded_from_disk = True
-                    break
 
     if not loaded_from_disk:
         print("computing circuit")
@@ -759,7 +755,7 @@ if __name__ == "__main__":
             edge_threshold=args.edge_threshold,
             pen_thickness=args.pen_thickness,
             annotations=annotations,
-            save_dir=f"{args.plot_dir}/{save_base}_node{args.node_threshold}_edge{args.edge_threshold}",
+            save_dir=f"{args.plot_dir}/{save_stem}",
             gemma_mode=(args.model == "google/gemma-2-2b"),
             parallel_attn=parallel_attn,
         )
@@ -772,7 +768,7 @@ if __name__ == "__main__":
             edge_threshold=args.edge_threshold,
             pen_thickness=args.pen_thickness,
             annotations=annotations,
-            save_dir=f"{args.plot_dir}/{save_base}_node{args.node_threshold}_edge{args.edge_threshold}_n{num_examples}_agg{args.aggregation}",
+            save_dir=f"{args.plot_dir}/{save_stem}",
             gemma_mode=(args.model == "google/gemma-2-2b"),
             parallel_attn=parallel_attn,
         )
