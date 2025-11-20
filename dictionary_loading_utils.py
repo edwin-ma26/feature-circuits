@@ -11,6 +11,29 @@ import os
 DICT_DIR = os.path.dirname(os.path.abspath(__file__)) + "/dictionaries"
 
 
+def _resolve_dict_subdir(base_dir: str, dict_id: str | int | None):
+    """Return the dictionary subdirectory that matches dict_id."""
+    available = sorted(
+        entry
+        for entry in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, entry))
+    )
+    if not available:
+        raise FileNotFoundError(f"No dictionaries found under {base_dir}")
+    if dict_id is None:
+        return available[0]
+
+    dict_id_str = str(dict_id)
+    if dict_id_str in available:
+        return dict_id_str
+    matches = [entry for entry in available if entry.startswith(f"{dict_id_str}_")]
+    if matches:
+        return matches[0]
+    raise ValueError(
+        f"Dictionary ID {dict_id} not found under {base_dir}. Available: {', '.join(available)}"
+    )
+
+
 def _get_preferred_device() -> t.device:
     """Return the preferred torch device.
 
@@ -85,6 +108,7 @@ def _load_pythia_saes_and_submodules(
     neurons: bool = False,
     dtype: t.dtype = t.float32,
     device: t.device | None = None,
+    dict_id: str | int | None = "10_32768",
 ):
     if device is None:
         device = _get_preferred_device()
@@ -98,6 +122,12 @@ def _load_pythia_saes_and_submodules(
     mlps = []
     resids = []
     dictionaries = {}
+    dict_id_value: str | int | None = dict_id
+
+    def _dict_path(base_dir: str) -> str:
+        subdir = _resolve_dict_subdir(base_dir, dict_id_value)
+        return os.path.join(base_dir, subdir, "ae.pt")
+
     if include_embed:
         embed = Submodule(
             name="embed",
@@ -105,7 +135,7 @@ def _load_pythia_saes_and_submodules(
         )
         if not neurons:
             dictionaries[embed] = _safe_autoencoder_from_pretrained(
-                f"{DICT_DIR}/pythia-70m-deduped/embed/10_32768/ae.pt",
+                _dict_path(f"{DICT_DIR}/pythia-70m-deduped/embed"),
                 dtype=dtype,
                 device=device,
             )
@@ -136,17 +166,17 @@ def _load_pythia_saes_and_submodules(
         )
         if not neurons:
             dictionaries[attn] = _safe_autoencoder_from_pretrained(
-                f"{DICT_DIR}/pythia-70m-deduped/attn_out_layer{i}/10_32768/ae.pt",
+                _dict_path(f"{DICT_DIR}/pythia-70m-deduped/attn_out_layer{i}"),
                 dtype=dtype,
                 device=device,
             )
             dictionaries[mlp] = _safe_autoencoder_from_pretrained(
-                f"{DICT_DIR}/pythia-70m-deduped/mlp_out_layer{i}/10_32768/ae.pt",
+                _dict_path(f"{DICT_DIR}/pythia-70m-deduped/mlp_out_layer{i}"),
                 dtype=dtype,
                 device=device,
             )
             dictionaries[resid] = _safe_autoencoder_from_pretrained(
-                f"{DICT_DIR}/pythia-70m-deduped/resid_out_layer{i}/10_32768/ae.pt",
+                _dict_path(f"{DICT_DIR}/pythia-70m-deduped/resid_out_layer{i}"),
                 dtype=dtype,
                 device=device,
             )
@@ -396,6 +426,7 @@ def load_saes_and_submodules(
     neurons: bool = False,
     dtype: t.dtype = t.float32,
     device: t.device | None = None,
+    dict_id: str | int | None = "10_32768",
 ):
     if device is None:
         device = _get_preferred_device()
@@ -410,6 +441,7 @@ def load_saes_and_submodules(
             neurons=neurons,
             dtype=dtype,
             device=device,
+            dict_id=dict_id,
         )
     elif model_name == "google/gemma-2-2b":
         return _load_gemma_saes_and_submodules(

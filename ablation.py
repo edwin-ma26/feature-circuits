@@ -3,7 +3,7 @@ import torch as t
 from argparse import ArgumentParser
 from activation_utils import SparseAct
 from data_loading_utils import load_examples
-from dictionary_loading_utils import load_saes_and_submodules
+from dictionary_loading_utils import load_saes_and_submodules, _get_preferred_device
 import os
 
 
@@ -103,7 +103,9 @@ if __name__ == "__main__":
         help="Data on which to evaluate the circuit.",
     )
     parser.add_argument(
+        "--num_examples",
         "--examples",
+        dest="num_examples",
         type=int,
         default=100,
         help="Number of examples over which to evaluate the circuit.",
@@ -120,35 +122,99 @@ if __name__ == "__main__":
         default=-1,
         help="Layer to evaluate the circuit from. Layers below --start_layer are given to the model for free.",
     )
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--end_layer",
+        type=int,
+        default=None,
+        help="Optional upper bound on layer indices (inclusive).",
+    )
+    parser.add_argument(
+        "--dict_id",
+        type=str,
+        default="10_32768",
+        help="Dictionary identifier (e.g. 10 or 10_32768) used when loading SAEs.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Number of examples per forward pass when evaluating (default: all examples).",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Torch device (e.g. cuda:0, mps, cpu). Defaults to auto-detected best device.",
+    )
     args = parser.parse_args()
 
-    dtype = {
+    if args.device is None:
+        preferred_device = _get_preferred_device()
+        device_str = str(preferred_device)
+    else:
+        device_str = args.device
+    args.device = device_str
+
+    dtype_map = {
         "EleutherAI/pythia-70m-deduped": t.float32,
         "google/gemma-2-2b": t.bfloat16,
-    }[args.model]
+        "gpt2": t.float32,
+        "openai-community/gpt2": t.float32,
+    }
+    if args.model not in dtype_map:
+        raise ValueError(
+            f"Model {args.model} not supported. Supported models: {', '.join(dtype_map)}"
+        )
+    dtype = dtype_map[args.model]
 
     model = LanguageModel(
         args.model,
         attn_implementation="eager",
         torch_dtype=dtype,
-        device_map=args.device,
+        device_map=device_str,
         dispatch=True,
     )
 
     submodules, dictionaries = load_saes_and_submodules(
-        model, include_embed=False, dtype=dtype, device=args.device
+        model,
+        include_embed=False,
+        dtype=dtype,
+        device=args.device,
+        dict_id=args.dict_id,
     )
 
-    submodules = [
-        s for s in submodules if int(s.name.split("_")[-1]) >= args.start_layer
-    ]
+    def _layer_index(name: str) -> int | None:
+        try:
+            return int(name.split("_")[-1])
+        except ValueError:
+            return None
+
+    filtered_submodules: list = []
+    for s in submodules:
+        layer_idx = _layer_index(s.name)
+        if layer_idx is None:
+            continue
+        if layer_idx < args.start_layer:
+            continue
+        if args.end_layer is not None and layer_idx > args.end_layer:
+            continue
+        filtered_submodules.append(s)
+    submodules = filtered_submodules
 
     # Load circuit
-    circuit = t.load(args.circuit)["nodes"]
-    nodes = {
-        submod: circuit[submod.name].abs() > args.threshold for submod in submodules
-    }
+    circuit = t.load(args.circuit, weights_only=False)["nodes"]
+    nodes = {}
+    retained_submodules = []
+    for submod in submodules:
+        if submod.name not in circuit:
+            continue
+        nodes[submod] = circuit[submod.name].abs() > args.threshold
+        retained_submodules.append(submod)
+    submodules = retained_submodules
+    if not submodules:
+        raise ValueError(
+            "No submodules remain after applying layer bounds or matching circuit keys."
+        )
 
     # Load examples
     # Accept either a bare name (e.g. rc_test), a filename (rc_test.json), or a full path.
@@ -159,7 +225,13 @@ if __name__ == "__main__":
     # Ensure .json extension
     if not dataset_path.endswith(".json"):
         dataset_path = dataset_path + ".json"
-    examples = load_examples(dataset_path, args.examples, model, use_min_length_only=True)
+    examples = load_examples(
+        dataset_path, args.num_examples, model, use_min_length_only=True
+    )
+    if not examples:
+        raise ValueError(
+            f"Failed to load any valid examples from {dataset_path} with --num_examples={args.num_examples}."
+        )
 
     # Define ablation function
     if args.ablation == "resample":
@@ -190,58 +262,101 @@ if __name__ == "__main__":
         device=args.device,
     )
 
-    def metric_fn(model):
-        logits = model.output.logits[:, -1, :]
-        return -t.gather(logits, dim=-1, index=patch_answer_idxs.view(-1, 1)).squeeze(
-            -1
-        ) + t.gather(logits, dim=-1, index=clean_answer_idxs.view(-1, 1)).squeeze(-1)
+    total_examples = len(clean_inputs)
+    if total_examples == 0:
+        raise ValueError("No valid examples available for evaluation.")
+
+    batch_size = args.batch_size or total_examples
+    if batch_size <= 0:
+        raise ValueError("--batch_size must be a positive integer.")
+
+    def make_metric_fn(clean_idxs, patch_idxs):
+        def metric_fn(model):
+            logits = model.output.logits[:, -1, :]
+            return -t.gather(
+                logits, dim=-1, index=patch_idxs.view(-1, 1)
+            ).squeeze(-1) + t.gather(
+                logits, dim=-1, index=clean_idxs.view(-1, 1)
+            ).squeeze(
+                -1
+            )
+
+        return metric_fn
+
+    def iter_batches():
+        for start in range(0, total_examples, batch_size):
+            end = min(start + batch_size, total_examples)
+            yield (
+                clean_inputs[start:end],
+                patch_inputs[start:end],
+                clean_answer_idxs[start:end],
+                patch_answer_idxs[start:end],
+            )
+
+    def build_empty_nodes():
+        return {
+            submod: SparseAct(
+                act=t.zeros(dictionaries[submod].dict_size, dtype=t.bool),
+                resc=t.zeros(1, dtype=t.bool),
+            ).to(args.device)
+            for submod in submodules
+        }
+
+    fm_batches: list[t.Tensor] = []
+    fc_batches: list[t.Tensor] = []
+    fempty_batches: list[t.Tensor] = []
 
     # Compute faithfulness
     with t.no_grad():
-        # Compute F(M)
-        with model.trace(clean_inputs):
-            metric = metric_fn(model).save()
-        fm = metric.value.mean().item()
+        for (
+            clean_batch,
+            patch_batch,
+            clean_idx_batch,
+            patch_idx_batch,
+        ) in iter_batches():
+            metric_fn = make_metric_fn(clean_idx_batch, patch_idx_batch)
 
-        # Compute F(C)
-        fc = (
-            run_with_ablations(
-                clean_inputs,
-                patch_inputs,
-                model,
-                submodules,
-                dictionaries,
-                nodes,
-                metric_fn,
-                ablation_fn=ablation_fn,
-                handle_errors=args.handle_errors,
-            )
-            .mean()
-            .item()
-        )
+            # Compute F(M) for this batch
+            with model.trace(clean_batch):
+                metric = metric_fn(model).save()
+            fm_batches.append(metric.value.detach().to("cpu"))
 
-        # Compute F(∅)
-        fempty = (
-            run_with_ablations(
-                clean_inputs,
-                patch_inputs,
-                model,
-                submodules,
-                dictionaries,
-                nodes={
-                    submod: SparseAct(
-                        act=t.zeros(dictionaries[submod].dict_size, dtype=t.bool),
-                        resc=t.zeros(1, dtype=t.bool),
-                    ).to(args.device)
-                    for submod in submodules
-                },
-                metric_fn=metric_fn,
-                ablation_fn=ablation_fn,
-                handle_errors=args.handle_errors,
+            # Compute F(C) for this batch
+            fc_batches.append(
+                run_with_ablations(
+                    clean_batch,
+                    patch_batch,
+                    model,
+                    submodules,
+                    dictionaries,
+                    nodes,
+                    metric_fn,
+                    ablation_fn=ablation_fn,
+                    handle_errors=args.handle_errors,
+                ).detach().to("cpu")
             )
-            .mean()
-            .item()
-        )
+
+            # Compute F(∅) for this batch
+            fempty_batches.append(
+                run_with_ablations(
+                    clean_batch,
+                    patch_batch,
+                    model,
+                    submodules,
+                    dictionaries,
+                    nodes=build_empty_nodes(),
+                    metric_fn=metric_fn,
+                    ablation_fn=ablation_fn,
+                    handle_errors=args.handle_errors,
+                ).detach().to("cpu")
+            )
+
+    def batch_mean(values: list[t.Tensor]) -> float:
+        return t.cat(values).mean().item()
+
+    fm = batch_mean(fm_batches)
+    fc = batch_mean(fc_batches)
+    fempty = batch_mean(fempty_batches)
 
     # Calculate faithfulness
     faithfulness = (fc - fempty) / (fm - fempty)
