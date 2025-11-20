@@ -53,6 +53,36 @@ def _sparse_reshape_safe(sparse_tensor, shape):
         return result
     return sparse_reshape(sparse_tensor, shape)
 
+
+def _coerce_device(device_like):
+    if device_like is None or isinstance(device_like, t.device):
+        return device_like
+    return t.device(device_like)
+
+
+def _resolve_storage_device(requested_storage, compute_device):
+    storage = _coerce_device(requested_storage)
+    if storage is not None:
+        return storage
+    if compute_device.type == "cpu":
+        return compute_device
+    return t.device("cpu")
+
+
+def _move_dictionaries_to(dictionaries, device):
+    if device is None:
+        return
+    target = _coerce_device(device)
+    seen = set()
+    for dictionary in dictionaries.values():
+        if dictionary is None:
+            continue
+        ident = id(dictionary)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        dictionary.to(device=target)
+
 def get_circuit(
     clean,
     patch,
@@ -239,6 +269,7 @@ def get_circuit_cluster(
     node_threshold=0.1,
     edge_threshold=0.01,
     device="cuda:0",
+    storage_device=None,
     dict_path="dictionaries/pythia-70m-deduped/",
     dataset_name="cluster_circuit",
     circuit_dir="circuits/",
@@ -246,7 +277,8 @@ def get_circuit_cluster(
     model=None,
     dictionaries=None,
 ):
-    
+    device = _coerce_device(device)
+    storage_device = _resolve_storage_device(storage_device, device)
     model_configs = {
         "EleutherAI/pythia-70m-deduped": dict(
             layers=6,
@@ -295,6 +327,11 @@ def get_circuit_cluster(
         device=device,
         dtype=dtype,
     )
+    if storage_device != device:
+        _move_dictionaries_to(dictionaries, storage_device)
+        dictionary_resident = storage_device
+    else:
+        dictionary_resident = device
 
     examples = load_examples_nopair(dataset, max_examples, model)
     num_examples = min(len(examples), max_examples)
@@ -312,6 +349,9 @@ def get_circuit_cluster(
     running_edges = None
 
     for batch in tqdm(batches, desc="Batches"):
+        if dictionary_resident != device:
+            _move_dictionaries_to(dictionaries, device)
+            dictionary_resident = device
         clean_inputs = [e["clean_prefix"] for e in batch]
         clean_answer_idxs = t.tensor(
             [model.tokenizer(e["clean_answer"]).input_ids[-1] for e in batch],
@@ -343,30 +383,36 @@ def get_circuit_cluster(
             edge_threshold=edge_threshold,
             parallel_attn=parallel_attn,
         )
+        if storage_device != device:
+            _move_dictionaries_to(dictionaries, storage_device)
+            dictionary_resident = storage_device
 
         if running_nodes is None:
             running_nodes = {
-                k: len(batch) * nodes[k].to("cpu") for k in nodes.keys() if k != "y"
+                k: len(batch) * nodes[k].to(storage_device) for k in nodes.keys() if k != "y"
             }
             running_edges = {
-                k: {kk: len(batch) * edges[k][kk].to("cpu") for kk in edges[k].keys()}
+                k: {kk: len(batch) * edges[k][kk].to(storage_device) for kk in edges[k].keys()}
                 for k in edges.keys()
             }
         else:
             for k in nodes.keys():
                 if k != "y":
-                    running_nodes[k] += len(batch) * nodes[k].to("cpu")
+                    running_nodes[k] += len(batch) * nodes[k].to(storage_device)
             for k in edges.keys():
                 for v in edges[k].keys():
-                    running_edges[k][v] += len(batch) * edges[k][v].to("cpu")
+                    running_edges[k][v] += len(batch) * edges[k][v].to(storage_device)
 
         # memory cleanup
         del nodes, edges
         gc.collect()
 
-    nodes = {k: v.to(device) / num_examples for k, v in running_nodes.items()}
+    nodes = {k: v.to(storage_device) / num_examples for k, v in running_nodes.items()}
     edges = {
-        k: {kk: 1 / num_examples * v.to(device) for kk, v in running_edges[k].items()}
+        k: {
+            kk: 1 / num_examples * _safe_to_device(v, storage_device)
+            for kk, v in running_edges[k].items()
+        }
         for k in running_edges.keys()
     }
 
@@ -512,6 +558,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=12)
     parser.add_argument("--device", type=str, default=None, help="Device to use (default: auto-detect MPS/CUDA/CPU)")
+    parser.add_argument(
+        "--storage_device",
+        type=str,
+        default=None,
+        help="Device to keep dictionaries/aggregates on (defaults to CPU when using CUDA/MPS).",
+    )
     args = parser.parse_args()
 
     if args.device is not None:
@@ -520,6 +572,8 @@ if __name__ == "__main__":
         device = _get_preferred_device()
 
     print(f"Using device: {device}")
+    storage_device = _resolve_storage_device(args.storage_device, device)
+    print(f"Caching dictionaries/aggregates on: {storage_device}")
 
     model_configs = {
         "EleutherAI/pythia-70m-deduped": dict(
@@ -635,11 +689,19 @@ if __name__ == "__main__":
             dtype=dtype,
             thru_layer=args.thru_layer,
         )
+        if storage_device != device:
+            _move_dictionaries_to(dictionaries, storage_device)
+            dictionary_resident = storage_device
+        else:
+            dictionary_resident = device
 
         running_nodes = None
         running_edges = None
 
         for batch in tqdm(batches, desc="Batches"):
+            if dictionary_resident != device:
+                _move_dictionaries_to(dictionaries, device)
+                dictionary_resident = device
             clean_inputs = [e["clean_prefix"] for e in batch]
             clean_answer_idxs = t.tensor(
                 [model.tokenizer(e["clean_answer"]).input_ids[-1] for e in batch],
@@ -688,15 +750,18 @@ if __name__ == "__main__":
                 parallel_attn=parallel_attn,
                 attrib_method=args.attrib_method,
             )
+            if storage_device != device:
+                _move_dictionaries_to(dictionaries, storage_device)
+                dictionary_resident = storage_device
 
             if running_nodes is None:
                 running_nodes = {
-                    k: len(batch) * nodes[k].to("cpu") for k in nodes.keys() if k != "y"
+                    k: len(batch) * nodes[k].to(storage_device) for k in nodes.keys() if k != "y"
                 }
                 if not args.nodes_only:
                     running_edges = {
                         k: {
-                            kk: len(batch) * edges[k][kk].to("cpu")
+                            kk: len(batch) * edges[k][kk].to(storage_device)
                             for kk in edges[k].keys()
                         }
                         for k in edges.keys()
@@ -704,21 +769,21 @@ if __name__ == "__main__":
             else:
                 for k in nodes.keys():
                     if k != "y":
-                        running_nodes[k] += len(batch) * nodes[k].to("cpu")
+                        running_nodes[k] += len(batch) * nodes[k].to(storage_device)
                 if not args.nodes_only:
                     for k in edges.keys():
                         for v in edges[k].keys():
-                            running_edges[k][v] += len(batch) * edges[k][v].to("cpu")
+                            running_edges[k][v] += len(batch) * edges[k][v].to(storage_device)
 
             # memory cleanup
             del nodes, edges
             gc.collect()
 
-        nodes = {k: v.to(device) / num_examples for k, v in running_nodes.items()}
+        nodes = {k: v.to(storage_device) / num_examples for k, v in running_nodes.items()}
         if not args.nodes_only:
             edges = {
                 k: {
-                    kk: 1 / num_examples * _safe_to_device(v, device)
+                    kk: 1 / num_examples * _safe_to_device(v, storage_device)
                     for kk, v in running_edges[k].items()
                 }
                 for k in running_edges.keys()
