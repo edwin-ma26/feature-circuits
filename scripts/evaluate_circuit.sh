@@ -24,9 +24,21 @@ if [ -n "$END_LAYER" ]; then
   CMD+=(--end_layer "$END_LAYER")
 fi
 
+# Detect best available device (prefer MPS, then CUDA, else CPU)
+DEVICE=$(python3 - <<'PY'
+import torch
+if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    print("mps")
+elif torch.cuda.is_available():
+    print("cuda")
+else:
+    print("cpu")
+PY
+)
+
 CMD+=(
 --batch_size 20
---device mps
+--device "$DEVICE"
 )
 
 "${CMD[@]}"
