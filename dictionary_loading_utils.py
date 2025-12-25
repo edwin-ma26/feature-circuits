@@ -93,10 +93,11 @@ def _safe_jumprelu_from_pretrained(
 DictionaryStash = namedtuple("DictionaryStash", ["embed", "attns", "mlps", "resids"])
 
 
+# Use the SAE-Lens releases keyed by TransformerLens hookpoints (matches `tl_backend.py`)
 GPT2_RELEASES = {
-    "attn": "jbloom/GPT2-Small-OAI-v5-32k-attn-out-SAEs",
-    "mlp": "jbloom/GPT2-Small-OAI-v5-32k-mlp-out-SAEs",
-    "resid": "jbloom/GPT2-Small-OAI-v5-32k-resid-post-SAEs",
+    "attn": "gpt2-small-attn-out-v5-32k",
+    "mlp": "gpt2-small-mlp-out-v5-32k",
+    "resid": "gpt2-small-resid-post-v5-32k",
 }
 
 
@@ -213,15 +214,20 @@ def load_gpt2_sae(
         raise ValueError(f"Unsupported GPT-2 submodule type: {submod_type}")
 
     repo_id = GPT2_RELEASES[submod_type]
-    sae_layer = f"v5_32k_layer_{layer}"
-    if submod_type == "resid":
-        sae_layer += ".pt"
+
+    # Use TransformerLens hookpoint IDs for SAE ids so they match SAE-Lens releases
+    if submod_type == "attn":
+        sae_id = f"blocks.{layer}.hook_attn_out"
+    elif submod_type == "mlp":
+        sae_id = f"blocks.{layer}.hook_mlp_out"
+    else:  # resid
+        sae_id = f"blocks.{layer}.hook_resid_post"
 
     return _safe_jumprelu_from_pretrained(
         None,
         load_from_sae_lens=True,
         release=repo_id,
-        sae_id=sae_layer,
+        sae_id=sae_id,
         dtype=dtype,
         device=device,
     )
