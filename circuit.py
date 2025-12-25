@@ -670,7 +670,9 @@ if __name__ == "__main__":
     elif use_tl:
         from transformer_lens import HookedTransformer
 
-        model = HookedTransformer.from_pretrained(args.model, device=str(device))
+        # HookedTransformer doesn't recognize openai-community/gpt2, map it to gpt2
+        tl_model_name = args.model if args.model != "openai-community/gpt2" else "gpt2"
+        model = HookedTransformer.from_pretrained(tl_model_name, device=str(device))
     else:  # GPT-2 variants (nnsight)
         model = LanguageModel(
             args.model,
