@@ -7,7 +7,7 @@ EDGE=$4
 AGG=$5
 shift 5
 
-python circuit.py \
+python3 circuit.py \
     --model "$MODEL" \
     --num_examples 100 \
     --batch_size 10 \

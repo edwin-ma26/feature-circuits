@@ -605,9 +605,10 @@ def plot_circuit(
                 d_layer = int(d_layer)
 
             if downstream_mod == "y":
-                # For y node, weight_matrix is just a vector [n_upstream_feats]
+                # For y node, weight_matrix is a vector [n_upstream_feats]
                 upstream_values = nodes[upstream_mod].to_tensor()
-                for idx in range(weight_matrix.shape[0]):
+                max_idx = min(weight_matrix.shape[0], upstream_values.shape[0])
+                for idx in range(max_idx):
                     if abs(upstream_values[idx]) > node_threshold:
                         name = get_name(u_component, u_layer, (idx,))
                         weight = weight_matrix[idx].item()
@@ -623,10 +624,14 @@ def plot_circuit(
                 upstream_values = nodes[upstream_mod].to_tensor()
                 downstream_values = nodes[downstream_mod].to_tensor()
                 
-                for d_idx in range(weight_matrix.shape[0]):
+                upstream_len = upstream_values.shape[0]
+                downstream_len = downstream_values.shape[0]
+                max_d = min(weight_matrix.shape[0], downstream_len)
+                max_u = min(weight_matrix.shape[1], upstream_len)
+                for d_idx in range(max_d):
                     if abs(downstream_values[d_idx]) > node_threshold:
                         d_name = get_name(d_component, d_layer, (d_idx,))
-                        for u_idx in range(weight_matrix.shape[1]):
+                        for u_idx in range(max_u):
                             if abs(upstream_values[u_idx]) > node_threshold:
                                 u_name = get_name(u_component, u_layer, (u_idx,))
                                 weight = weight_matrix[d_idx, u_idx].item()

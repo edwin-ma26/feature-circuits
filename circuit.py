@@ -83,6 +83,16 @@ def _move_dictionaries_to(dictionaries, device):
         seen.add(ident)
         dictionary.to(device=target)
 
+def _use_tl_backend(model_name: str) -> bool:
+    return model_name in {"gpt2", "openai-community/gpt2"}
+
+def _tl_final_logits(logits: t.Tensor) -> t.Tensor:
+    if logits.dim() == 3:
+        return logits[:, -1, :]
+    if logits.dim() == 2:
+        return logits
+    raise ValueError(f"Unexpected logits shape for TL backend: {tuple(logits.shape)}")
+
 def get_circuit(
     clean,
     patch,
@@ -99,13 +109,15 @@ def get_circuit(
     parallel_attn=False,
     node_threshold=0.1,
     attrib_method="ig",
+    patching_effect_fn=patching_effect,
+    jvp_fn=jvp,
 ):
     all_submods = ([embed] if embed is not None else []) + [
         submod for layer_submods in zip(attns, mlps, resids) for submod in layer_submods
     ]
 
     # first get the patching effect of everything on y
-    effects, deltas, grads, total_effect = patching_effect(
+    effects, deltas, grads, total_effect = patching_effect_fn(
         clean,
         patch,
         model,
@@ -144,7 +156,7 @@ def get_circuit(
     }
 
     def N(upstream, downstream, midstream=[]):
-        result = jvp(
+        result = jvp_fn(
             clean,
             model,
             dictionaries,
@@ -313,20 +325,42 @@ def get_circuit_cluster(
     include_embed = config["include_embed"]
     dtype = config["dtype"]
 
+    use_tl = _use_tl_backend(model_name)
     if model_name == "EleutherAI/pythia-70m-deduped":
         model = LanguageModel(model_name, device_map=device, dispatch=True, torch_dtype=dtype)
     elif model_name == "google/gemma-2-2b":
         model = LanguageModel(model_name, device_map=device, dispatch=True, attn_implementation="eager", torch_dtype=dtype)
+    elif use_tl:
+        from transformer_lens import HookedTransformer
+        from tl_backend import load_tl_gpt2_saes_and_submodules
+
+        model = HookedTransformer.from_pretrained(model_name, device=str(device))
     else:
         model = LanguageModel(model_name, device_map=device, dispatch=True, torch_dtype=dtype)
-    
-    submodules, dictionaries = load_saes_and_submodules(
-        model,
-        separate_by_type=True,
-        include_embed=include_embed,
-        device=device,
-        dtype=dtype,
-    )
+
+    if use_tl:
+        from tl_backend import tl_jvp, tl_patching_effect
+
+        submodules, dictionaries = load_tl_gpt2_saes_and_submodules(
+            model,
+            separate_by_type=True,
+            include_embed=include_embed,
+            device=device,
+            thru_layer=None,
+            neurons=False,
+        )
+        patching_effect_fn = tl_patching_effect
+        jvp_fn = tl_jvp
+    else:
+        submodules, dictionaries = load_saes_and_submodules(
+            model,
+            separate_by_type=True,
+            include_embed=include_embed,
+            device=device,
+            dtype=dtype,
+        )
+        patching_effect_fn = patching_effect
+        jvp_fn = jvp
     if storage_device != device:
         _move_dictionaries_to(dictionaries, storage_device)
         dictionary_resident = storage_device
@@ -361,12 +395,20 @@ def get_circuit_cluster(
 
         patch_inputs = None
 
-        def metric_fn(model):
-            return -1 * t.gather(
-                model.output.logits[:, -1, :],
-                dim=-1,
-                index=clean_answer_idxs.view(-1, 1),
-            ).squeeze(-1)
+        if use_tl:
+            def metric_fn(logits):
+                return -1 * t.gather(
+                    _tl_final_logits(logits),
+                    dim=-1,
+                    index=clean_answer_idxs.view(-1, 1),
+                ).squeeze(-1)
+        else:
+            def metric_fn(model):
+                return -1 * t.gather(
+                    model.output.logits[:, -1, :],
+                    dim=-1,
+                    index=clean_answer_idxs.view(-1, 1),
+                ).squeeze(-1)
 
         nodes, edges = get_circuit(
             clean_inputs,
@@ -382,6 +424,8 @@ def get_circuit_cluster(
             node_threshold=node_threshold,
             edge_threshold=edge_threshold,
             parallel_attn=parallel_attn,
+            patching_effect_fn=patching_effect_fn,
+            jvp_fn=jvp_fn,
         )
         if storage_device != device:
             _move_dictionaries_to(dictionaries, storage_device)
@@ -612,6 +656,7 @@ if __name__ == "__main__":
     include_embed = config["include_embed"]
     dtype = config["dtype"]
 
+    use_tl = _use_tl_backend(args.model)
     if args.model == "EleutherAI/pythia-70m-deduped":
         model = LanguageModel(args.model, device_map=device, dispatch=True, torch_dtype=dtype)
     elif args.model == "google/gemma-2-2b":
@@ -622,7 +667,11 @@ if __name__ == "__main__":
             attn_implementation="eager",
             torch_dtype=dtype,
         )
-    else:  # GPT-2 variants
+    elif use_tl:
+        from transformer_lens import HookedTransformer
+
+        model = HookedTransformer.from_pretrained(args.model, device=str(device))
+    else:  # GPT-2 variants (nnsight)
         model = LanguageModel(
             args.model,
             device_map=device,
@@ -680,15 +729,31 @@ if __name__ == "__main__":
 
     if not loaded_from_disk:
         print("computing circuit")
-        submodules, dictionaries = load_saes_and_submodules(
-            model,
-            separate_by_type=True,
-            include_embed=include_embed,
-            neurons=args.use_neurons,
-            device=device,
-            dtype=dtype,
-            thru_layer=args.thru_layer,
-        )
+        if use_tl:
+            from tl_backend import load_tl_gpt2_saes_and_submodules, tl_jvp, tl_patching_effect
+
+            submodules, dictionaries = load_tl_gpt2_saes_and_submodules(
+                model,
+                separate_by_type=True,
+                include_embed=include_embed,
+                neurons=args.use_neurons,
+                device=device,
+                thru_layer=args.thru_layer,
+            )
+            patching_effect_fn = tl_patching_effect
+            jvp_fn = tl_jvp
+        else:
+            submodules, dictionaries = load_saes_and_submodules(
+                model,
+                separate_by_type=True,
+                include_embed=include_embed,
+                neurons=args.use_neurons,
+                device=device,
+                dtype=dtype,
+                thru_layer=args.thru_layer,
+            )
+            patching_effect_fn = patching_effect
+            jvp_fn = jvp
         if storage_device != device:
             _move_dictionaries_to(dictionaries, storage_device)
             dictionary_resident = storage_device
@@ -712,12 +777,20 @@ if __name__ == "__main__":
             if args.nopair:
                 patch_inputs = None
 
-                def metric_fn(model):
-                    return -1 * t.gather(
-                        model.output.logits[:, -1, :],
-                        dim=-1,
-                        index=clean_answer_idxs.view(-1, 1),
-                    ).squeeze(-1)
+                if use_tl:
+                    def metric_fn(logits):
+                        return -1 * t.gather(
+                            _tl_final_logits(logits),
+                            dim=-1,
+                            index=clean_answer_idxs.view(-1, 1),
+                        ).squeeze(-1)
+                else:
+                    def metric_fn(model):
+                        return -1 * t.gather(
+                            model.output.logits[:, -1, :],
+                            dim=-1,
+                            index=clean_answer_idxs.view(-1, 1),
+                        ).squeeze(-1)
             else:
                 patch_inputs = [e["patch_prefix"] for e in batch]
                 patch_answer_idxs = t.tensor(
@@ -726,13 +799,25 @@ if __name__ == "__main__":
                     device=device,
                 )
 
-                def metric_fn(model):
-                    logits = model.output.logits[:, -1, :]
-                    return t.gather(
-                        logits, dim=-1, index=patch_answer_idxs.view(-1, 1)
-                    ).squeeze(-1) - t.gather(
-                        logits, dim=-1, index=clean_answer_idxs.view(-1, 1)
-                    ).squeeze(-1)
+                if use_tl:
+                    def metric_fn(logits):
+                        return t.gather(
+                            _tl_final_logits(logits),
+                            dim=-1,
+                            index=patch_answer_idxs.view(-1, 1),
+                        ).squeeze(-1) - t.gather(
+                            _tl_final_logits(logits),
+                            dim=-1,
+                            index=clean_answer_idxs.view(-1, 1),
+                        ).squeeze(-1)
+                else:
+                    def metric_fn(model):
+                        logits = model.output.logits[:, -1, :]
+                        return t.gather(
+                            logits, dim=-1, index=patch_answer_idxs.view(-1, 1)
+                        ).squeeze(-1) - t.gather(
+                            logits, dim=-1, index=clean_answer_idxs.view(-1, 1)
+                        ).squeeze(-1)
 
             nodes, edges = get_circuit(
                 clean_inputs,
@@ -749,6 +834,8 @@ if __name__ == "__main__":
                 node_threshold=args.node_threshold,
                 parallel_attn=parallel_attn,
                 attrib_method=args.attrib_method,
+                patching_effect_fn=patching_effect_fn,
+                jvp_fn=jvp_fn,
             )
             if storage_device != device:
                 _move_dictionaries_to(dictionaries, storage_device)

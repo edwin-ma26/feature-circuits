@@ -458,7 +458,7 @@ def load_saes_and_submodules(
             model,
             thru_layer=thru_layer,
             separate_by_type=separate_by_type,
-            include_embed=include_embed,
+            include_embed=False,
             neurons=neurons,
             dtype=dtype,
             device=device,
